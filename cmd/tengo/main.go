@@ -11,12 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/d5/tengo/compiler"
-	"github.com/d5/tengo/compiler/ast"
-	"github.com/d5/tengo/compiler/parser"
-	"github.com/d5/tengo/compiler/source"
-	"github.com/d5/tengo/objects"
-	"github.com/d5/tengo/runtime"
+	"github.com/d5/tengo/v2"
+	"github.com/d5/tengo/v2/parser"
+	"github.com/d5/tengo/v2/stdlib"
 )
 
 const (
@@ -25,15 +22,19 @@ const (
 )
 
 var (
-	compile    bool
-	showHelp   bool
-	outputFile = flag.String("o", "", "Output file")
+	compileOutput string
+	showHelp      bool
+	showVersion   bool
+	resolvePath   bool // TODO Remove this flag at version 3
+	version       = "dev"
 )
 
 func init() {
 	flag.BoolVar(&showHelp, "help", false, "Show help")
-	flag.BoolVar(&compile, "compile", false, "Compile input file")
-	flag.BoolVar(&compile, "c", false, "Compile input file")
+	flag.StringVar(&compileOutput, "o", "", "Compile output file")
+	flag.BoolVar(&showVersion, "version", false, "Show version")
+	flag.BoolVar(&resolvePath, "resolve", false,
+		"Resolve relative import paths")
 	flag.Parse()
 }
 
@@ -41,68 +42,65 @@ func main() {
 	if showHelp {
 		doHelp()
 		os.Exit(2)
+	} else if showVersion {
+		fmt.Println(version)
+		return
 	}
 
+	modules := stdlib.GetModuleMap(stdlib.AllModuleNames()...)
 	inputFile := flag.Arg(0)
 	if inputFile == "" {
 		// REPL
-		doRepl(os.Stdin, os.Stdout)
+		RunREPL(modules, os.Stdin, os.Stdout)
 		return
 	}
 
 	inputData, err := ioutil.ReadFile(inputFile)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error reading input file: %s", err.Error())
+		_, _ = fmt.Fprintf(os.Stderr,
+			"Error reading input file: %s\n", err.Error())
 		os.Exit(1)
 	}
 
-	if compile {
-		if err := doCompile(inputData, inputFile, *outputFile); err != nil {
+	inputFile, err = filepath.Abs(inputFile)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error file path: %s\n", err)
+		os.Exit(1)
+	}
+
+	if len(inputData) > 1 && string(inputData[:2]) == "#!" {
+		copy(inputData, "//")
+	}
+
+	if compileOutput != "" {
+		err := CompileOnly(modules, inputData, inputFile,
+			compileOutput)
+		if err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 	} else if filepath.Ext(inputFile) == sourceFileExt {
-		if err := doCompileRun(inputData, inputFile, *outputFile); err != nil {
+		err := CompileAndRun(modules, inputData, inputFile)
+		if err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 	} else {
-		if err := doRun(inputData, inputFile, *outputFile); err != nil {
+		if err := RunCompiled(modules, inputData); err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
 	}
 }
 
-func doHelp() {
-	fmt.Println("Usage:")
-	fmt.Println()
-	fmt.Println("	tengo [flags] {input-file}")
-	fmt.Println()
-	fmt.Println("Flags:")
-	fmt.Println()
-	fmt.Println("	-c/-compile compile the input and produce bytecode file")
-	fmt.Println("	-o          output")
-	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Println()
-	fmt.Println("	tengo")
-	fmt.Println("	            : Start Tengo REPL")
-	fmt.Println()
-	fmt.Println("	tengo myapp.tengo")
-	fmt.Println("	            : Compile and execute source file (myapp.tengo)")
-	fmt.Println()
-	fmt.Println("	tengo -c myapp myapp.tengo")
-	fmt.Println("	            : Compile source file (myapp.tengo) and produce bytecode file (myapp)")
-	fmt.Println()
-	fmt.Println("	tengo myapp")
-	fmt.Println("	            : Execute bytecode file (myapp)")
-	fmt.Println()
-	fmt.Println()
-}
-
-func doCompile(data []byte, inputFile, outputFile string) (err error) {
-	bytecode, err := compileSrc(data, filepath.Base(inputFile))
+// CompileOnly compiles the source code and writes the compiled binary into
+// outputFile.
+func CompileOnly(
+	modules *tengo.ModuleMap,
+	data []byte,
+	inputFile, outputFile string,
+) (err error) {
+	bytecode, err := compileSrc(modules, data, inputFile)
 	if err != nil {
 		return
 	}
@@ -127,141 +125,191 @@ func doCompile(data []byte, inputFile, outputFile string) (err error) {
 	if err != nil {
 		return
 	}
-
 	fmt.Println(outputFile)
-
 	return
 }
 
-func doCompileRun(data []byte, inputFile, _ string) (err error) {
-	bytecode, err := compileSrc(data, filepath.Base(inputFile))
+// CompileAndRun compiles the source code and executes it.
+func CompileAndRun(
+	modules *tengo.ModuleMap,
+	data []byte,
+	inputFile string,
+) (err error) {
+	bytecode, err := compileSrc(modules, data, inputFile)
 	if err != nil {
 		return
 	}
 
-	machine := runtime.NewVM(bytecode, nil)
-
+	machine := tengo.NewVM(bytecode, nil, -1)
 	err = machine.Run()
-	if err != nil {
-		return
-	}
-
 	return
 }
 
-func doRun(data []byte, _, _ string) (err error) {
-	bytecode := &compiler.Bytecode{}
-	err = bytecode.Decode(bytes.NewReader(data))
+// RunCompiled reads the compiled binary from file and executes it.
+func RunCompiled(modules *tengo.ModuleMap, data []byte) (err error) {
+	bytecode := &tengo.Bytecode{}
+	err = bytecode.Decode(bytes.NewReader(data), modules)
 	if err != nil {
 		return
 	}
 
-	machine := runtime.NewVM(bytecode, nil)
-
+	machine := tengo.NewVM(bytecode, nil, -1)
 	err = machine.Run()
-	if err != nil {
-		return
-	}
-
 	return
 }
 
-func doRepl(in io.Reader, out io.Writer) {
+// RunREPL starts REPL.
+func RunREPL(modules *tengo.ModuleMap, in io.Reader, out io.Writer) {
 	stdin := bufio.NewScanner(in)
-
-	fileSet := source.NewFileSet()
-	globals := make([]*objects.Object, runtime.GlobalsSize)
-
-	symbolTable := compiler.NewSymbolTable()
-	for idx, fn := range objects.Builtins {
+	fileSet := parser.NewFileSet()
+	globals := make([]tengo.Object, tengo.GlobalsSize)
+	symbolTable := tengo.NewSymbolTable()
+	for idx, fn := range tengo.GetAllBuiltinFunctions() {
 		symbolTable.DefineBuiltin(idx, fn.Name)
 	}
 
-	for {
-		_, _ = fmt.Fprintf(out, replPrompt)
+	// embed println function
+	symbol := symbolTable.Define("__repl_println__")
+	globals[symbol.Index] = &tengo.UserFunction{
+		Name: "println",
+		Value: func(args ...tengo.Object) (ret tengo.Object, err error) {
+			var printArgs []interface{}
+			for _, arg := range args {
+				if _, isUndefined := arg.(*tengo.Undefined); isUndefined {
+					printArgs = append(printArgs, "<undefined>")
+				} else {
+					s, _ := tengo.ToString(arg)
+					printArgs = append(printArgs, s)
+				}
+			}
+			printArgs = append(printArgs, "\n")
+			_, _ = fmt.Print(printArgs...)
+			return
+		},
+	}
 
+	var constants []tengo.Object
+	for {
+		_, _ = fmt.Fprint(out, replPrompt)
 		scanned := stdin.Scan()
 		if !scanned {
 			return
 		}
 
 		line := stdin.Text()
-
-		file, err := parser.ParseFile(fileSet.AddFile("test", -1, len(line)), []byte(line), nil)
+		srcFile := fileSet.AddFile("repl", -1, len(line))
+		p := parser.NewParser(srcFile, []byte(line), nil)
+		file, err := p.ParseFile()
 		if err != nil {
-			_, _ = fmt.Fprintf(out, "error: %s\n", err.Error())
+			_, _ = fmt.Fprintln(out, err.Error())
 			continue
 		}
 
 		file = addPrints(file)
-
-		c := compiler.NewCompiler(symbolTable, nil, nil)
+		c := tengo.NewCompiler(srcFile, symbolTable, constants, modules, nil)
 		if err := c.Compile(file); err != nil {
-			_, _ = fmt.Fprintf(out, "Compilation error:\n %s\n", err.Error())
+			_, _ = fmt.Fprintln(out, err.Error())
 			continue
 		}
 
-		machine := runtime.NewVM(c.Bytecode(), globals)
-		if err != nil {
-			_, _ = fmt.Fprintf(out, "VM error:\n %s\n", err.Error())
-			continue
-		}
+		bytecode := c.Bytecode()
+		machine := tengo.NewVM(bytecode, globals, -1)
 		if err := machine.Run(); err != nil {
-			_, _ = fmt.Fprintf(out, "Execution error:\n %s\n", err.Error())
+			_, _ = fmt.Fprintln(out, err.Error())
 			continue
 		}
+		constants = bytecode.Constants
 	}
 }
 
-func compileSrc(src []byte, filename string) (*compiler.Bytecode, error) {
-	fileSet := source.NewFileSet()
+func compileSrc(
+	modules *tengo.ModuleMap,
+	src []byte,
+	inputFile string,
+) (*tengo.Bytecode, error) {
+	fileSet := parser.NewFileSet()
+	srcFile := fileSet.AddFile(filepath.Base(inputFile), -1, len(src))
 
-	p := parser.NewParser(fileSet.AddFile(filename, -1, len(src)), src, nil)
+	p := parser.NewParser(srcFile, src, nil)
 	file, err := p.ParseFile()
 	if err != nil {
 		return nil, err
 	}
 
-	c := compiler.NewCompiler(nil, nil, nil)
+	c := tengo.NewCompiler(srcFile, nil, nil, modules, nil)
+	c.EnableFileImport(true)
+	if resolvePath {
+		c.SetImportDir(filepath.Dir(inputFile))
+	}
+
 	if err := c.Compile(file); err != nil {
 		return nil, err
 	}
 
-	return c.Bytecode(), nil
+	bytecode := c.Bytecode()
+	bytecode.RemoveDuplicates()
+	return bytecode, nil
 }
 
-func addPrints(file *ast.File) *ast.File {
-	var stmts []ast.Stmt
+func doHelp() {
+	fmt.Println("Usage:")
+	fmt.Println()
+	fmt.Println("	tengo [flags] {input-file}")
+	fmt.Println()
+	fmt.Println("Flags:")
+	fmt.Println()
+	fmt.Println("	-o        compile output file")
+	fmt.Println("	-version  show version")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println()
+	fmt.Println("	tengo")
+	fmt.Println()
+	fmt.Println("	          Start Tengo REPL")
+	fmt.Println()
+	fmt.Println("	tengo myapp.tengo")
+	fmt.Println()
+	fmt.Println("	          Compile and run source file (myapp.tengo)")
+	fmt.Println("	          Source file must have .tengo extension")
+	fmt.Println()
+	fmt.Println("	tengo -o myapp myapp.tengo")
+	fmt.Println()
+	fmt.Println("	          Compile source file (myapp.tengo) into bytecode file (myapp)")
+	fmt.Println()
+	fmt.Println("	tengo myapp")
+	fmt.Println()
+	fmt.Println("	          Run bytecode file (myapp)")
+	fmt.Println()
+	fmt.Println()
+}
+
+func addPrints(file *parser.File) *parser.File {
+	var stmts []parser.Stmt
 	for _, s := range file.Stmts {
 		switch s := s.(type) {
-		case *ast.ExprStmt:
-			stmts = append(stmts, &ast.ExprStmt{
-				Expr: &ast.CallExpr{
-					Func: &ast.Ident{
-						Name: "print",
-					},
-					Args: []ast.Expr{s.Expr},
+		case *parser.ExprStmt:
+			stmts = append(stmts, &parser.ExprStmt{
+				Expr: &parser.CallExpr{
+					Func: &parser.Ident{Name: "__repl_println__"},
+					Args: []parser.Expr{s.Expr},
 				},
 			})
-
-		case *ast.AssignStmt:
+		case *parser.AssignStmt:
 			stmts = append(stmts, s)
 
-			stmts = append(stmts, &ast.ExprStmt{
-				Expr: &ast.CallExpr{
-					Func: &ast.Ident{
-						Name: "print",
+			stmts = append(stmts, &parser.ExprStmt{
+				Expr: &parser.CallExpr{
+					Func: &parser.Ident{
+						Name: "__repl_println__",
 					},
 					Args: s.LHS,
 				},
 			})
-
 		default:
 			stmts = append(stmts, s)
 		}
 	}
-
-	return &ast.File{
+	return &parser.File{
 		InputFile: file.InputFile,
 		Stmts:     stmts,
 	}
@@ -269,11 +317,9 @@ func addPrints(file *ast.File) *ast.File {
 
 func basename(s string) string {
 	s = filepath.Base(s)
-
 	n := strings.LastIndexByte(s, '.')
 	if n > 0 {
 		return s[:n]
 	}
-
 	return s
 }
