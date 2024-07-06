@@ -218,30 +218,30 @@ func (v *VM) run() {
 				return
 			}
 		case parser.OpJumpFalsy:
-			v.ip += 2
+			v.ip += 4
 			v.sp--
 			if v.stack[v.sp].IsFalsy() {
-				pos := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8
+				pos := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8 | int(v.curInsts[v.ip-2])<<16 | int(v.curInsts[v.ip-3])<<24
 				v.ip = pos - 1
 			}
 		case parser.OpAndJump:
-			v.ip += 2
+			v.ip += 4
 			if v.stack[v.sp-1].IsFalsy() {
-				pos := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8
+				pos := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8 | int(v.curInsts[v.ip-2])<<16 | int(v.curInsts[v.ip-3])<<24
 				v.ip = pos - 1
 			} else {
 				v.sp--
 			}
 		case parser.OpOrJump:
-			v.ip += 2
+			v.ip += 4
 			if v.stack[v.sp-1].IsFalsy() {
 				v.sp--
 			} else {
-				pos := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8
+				pos := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8 | int(v.curInsts[v.ip-2])<<16 | int(v.curInsts[v.ip-3])<<24
 				v.ip = pos - 1
 			}
 		case parser.OpJump:
-			pos := int(v.curInsts[v.ip+2]) | int(v.curInsts[v.ip+1])<<8
+			pos := int(v.curInsts[v.ip+4]) | int(v.curInsts[v.ip+3])<<8 | int(v.curInsts[v.ip+2])<<16 | int(v.curInsts[v.ip+1])<<24
 			v.ip = pos - 1
 		case parser.OpSetGlobal:
 			v.ip += 2
@@ -376,8 +376,8 @@ func (v *VM) run() {
 
 			var lowIdx int64
 			if low != UndefinedValue {
-				if low, ok := low.(*Int); ok {
-					lowIdx = low.Value
+				if lowInt, ok := low.(*Int); ok {
+					lowIdx = lowInt.Value
 				} else {
 					v.err = fmt.Errorf("invalid slice index type: %s",
 						low.TypeName())
@@ -391,8 +391,8 @@ func (v *VM) run() {
 				var highIdx int64
 				if high == UndefinedValue {
 					highIdx = numElements
-				} else if high, ok := high.(*Int); ok {
-					highIdx = high.Value
+				} else if highInt, ok := high.(*Int); ok {
+					highIdx = highInt.Value
 				} else {
 					v.err = fmt.Errorf("invalid slice index type: %s",
 						high.TypeName())
@@ -428,8 +428,8 @@ func (v *VM) run() {
 				var highIdx int64
 				if high == UndefinedValue {
 					highIdx = numElements
-				} else if high, ok := high.(*Int); ok {
-					highIdx = high.Value
+				} else if highInt, ok := high.(*Int); ok {
+					highIdx = highInt.Value
 				} else {
 					v.err = fmt.Errorf("invalid slice index type: %s",
 						high.TypeName())
@@ -465,8 +465,8 @@ func (v *VM) run() {
 				var highIdx int64
 				if high == UndefinedValue {
 					highIdx = numElements
-				} else if high, ok := high.(*Int); ok {
-					highIdx = high.Value
+				} else if highInt, ok := high.(*Int); ok {
+					highIdx = highInt.Value
 				} else {
 					v.err = fmt.Errorf("invalid slice index type: %s",
 						high.TypeName())
@@ -502,8 +502,8 @@ func (v *VM) run() {
 				var highIdx int64
 				if high == UndefinedValue {
 					highIdx = numElements
-				} else if high, ok := high.(*Int); ok {
-					highIdx = high.Value
+				} else if highInt, ok := high.(*Int); ok {
+					highIdx = highInt.Value
 				} else {
 					v.err = fmt.Errorf("invalid slice index type: %s",
 						high.TypeName())
@@ -534,6 +534,9 @@ func (v *VM) run() {
 				}
 				v.stack[v.sp] = val
 				v.sp++
+			default:
+				v.err = fmt.Errorf("not indexable: %s", left.TypeName())
+				return
 			}
 		case parser.OpCall:
 			numArgs := int(v.curInsts[v.ip+1])
@@ -767,6 +770,7 @@ func (v *VM) run() {
 				NumLocals:     fn.NumLocals,
 				NumParameters: fn.NumParameters,
 				VarArgs:       fn.VarArgs,
+				SourceMap:     fn.SourceMap,
 				Free:          free,
 			}
 			v.allocs--
